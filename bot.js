@@ -890,7 +890,6 @@ function setupEventHandlers(client) {
         if (member.userId === client.getUserId()) return; // Ignore bot's own joins
         
         const userId = member.userId;
-        const roomId = member.roomId;
         
         // Handle admin users - set power level 80 automatically
         if (isAdmin(userId)) {
