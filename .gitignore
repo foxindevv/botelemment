@@ -1,0 +1,14 @@
+node_modules/
+.env
+data.json
+*.log
+.DS_Store
+.vscode/
+.idea/
+.git/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+fix-repo-structure.sh

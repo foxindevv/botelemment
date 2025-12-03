@@ -1,0 +1,21 @@
+# fly.toml - Configuration for Fly.io deployment
+# Run: fly launch (first time) or fly deploy (to update)
+
+app = "matrix-bot"
+primary_region = "iad"  # Change to your preferred region: iad, fra, lhr, etc.
+
+[build]
+
+[env]
+  NODE_ENV = "production"
+
+# No HTTP service needed for a bot, but Fly requires at least one service
+[[services]]
+  internal_port = 8080
+  protocol = "tcp"
+  processes = ["app"]
+
+  [[services.ports]]
+    port = 80
+    handlers = ["http"]
+
