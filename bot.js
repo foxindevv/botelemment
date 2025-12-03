@@ -2,6 +2,7 @@ import sdk from "matrix-js-sdk";
 import * as dotenv from "dotenv";
 import fs from "fs";
 import Olm from "@matrix-org/olm";
+import http from "http";
 
 dotenv.config();
 
@@ -247,6 +248,57 @@ function formatWelcomeMessage(userId, displayName, profileId) {
     return message;
 }
 
+// Set admin power level (80) for admin users
+async function setAdminPowerLevel(roomId, userId) {
+    try {
+        // Get current power levels
+        const currentPowerLevels = await client.getStateEvent(roomId, "m.room.power_levels", "");
+        
+        // Check current power level
+        const currentLevel = currentPowerLevels.users?.[userId];
+        if (currentLevel !== undefined && currentLevel >= 80) {
+            console.log(`✅ User ${userId} already has admin power level (${currentLevel})`);
+            return true;
+        }
+        
+        // Create a completely new clean JSON object
+        const powerLevels = {
+            users: { ...(currentPowerLevels.users || {}) },
+            users_default: currentPowerLevels.users_default ?? 0,
+            events: { ...(currentPowerLevels.events || {}) },
+            state_default: currentPowerLevels.state_default ?? 0,
+            ban: currentPowerLevels.ban ?? 50,
+            kick: currentPowerLevels.kick ?? 50,
+            redact: currentPowerLevels.redact ?? 50
+        };
+        
+        // Set user's power level to 80 (admin level)
+        powerLevels.users[userId] = 80;
+        
+        // Use direct HTTP API call to avoid SDK serialization issues
+        const encodedRoomId = encodeURIComponent(roomId);
+        const response = await fetch(`${config.homeserverUrl}/_matrix/client/v3/rooms/${encodedRoomId}/state/m.room.power_levels/`, {
+            method: 'PUT',
+            headers: {
+                'Authorization': `Bearer ${config.accessToken}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify(powerLevels)
+        });
+        
+        if (!response.ok) {
+            const errorData = await response.json().catch(() => ({}));
+            throw new Error(`HTTP ${response.status}: ${errorData.error || response.statusText}`);
+        }
+        
+        console.log(`✅ Set admin power level (80) for user ${userId} in room ${roomId}`);
+        return true;
+    } catch (error) {
+        console.error(`❌ Failed to set admin power level for ${userId}:`, error.message);
+        return false;
+    }
+}
+
 // Mute user function
 async function muteUser(roomId, userId, reason = "") {
     try {
@@ -467,7 +519,32 @@ async function banUser(roomId, userId, reason = "") {
 // Kick user function
 async function kickUser(roomId, userId, reason = "") {
     try {
+        // Check bot's power level first
+        const powerInfo = await checkBotPowerLevel(roomId);
+        if (!powerInfo) {
+            console.error("❌ Could not check bot power level");
+            return false;
+        }
+        
+        // Get kick requirement
+        const currentPowerLevels = await client.getStateEvent(roomId, "m.room.power_levels", "");
+        const kickLevel = currentPowerLevels.kick ?? 50;
+        
+        // Check if bot has enough power to kick
+        if (powerInfo.botPowerLevel < kickLevel) {
+            console.error(`❌ Bot power level (${powerInfo.botPowerLevel}) is too low to kick (requires ${kickLevel})`);
+            return false;
+        }
+        
+        // Check if target user is admin (power level >= 50)
+        const targetUserLevel = currentPowerLevels.users?.[userId] ?? currentPowerLevels.users_default ?? 0;
+        if (targetUserLevel >= 50) {
+            console.error(`❌ Cannot kick admin user ${userId} (power level: ${targetUserLevel})`);
+            return false;
+        }
+        
         await client.kick(roomId, userId, reason || "Kicked by admin");
+        console.log(`✅ Successfully kicked user ${userId} from room ${roomId}`);
         return true;
     } catch (error) {
         console.error("Error kicking user:", error);
@@ -785,6 +862,24 @@ function setupEventHandlers(client) {
                 console.log(`   ⚠️  Bot cannot send messages in this room. Set permissions in Element to enable bot functionality.`);
             } else if (powerInfo && powerInfo.canSend) {
                 console.log(`   ✅ Bot is ready to work in this room!`);
+                
+                // Check for existing admin users and set their power levels
+                try {
+                    const members = room?.getMembers() || [];
+                    const joinedMembers = members.filter(m => m.membership === "join");
+                    console.log(`   🔍 Checking ${joinedMembers.length} existing members for admin users...`);
+                    
+                    for (const member of joinedMembers) {
+                        if (member.userId === client.getUserId()) continue; // Skip bot
+                        if (isAdmin(member.userId)) {
+                            console.log(`   👑 Found admin user: ${member.userId}`);
+                            await setAdminPowerLevel(roomId, member.userId);
+                        }
+                    }
+                } catch (error) {
+                    console.error(`   ⚠️  Error checking existing members:`, error.message);
+                }
+                
                 // Send online message
                 await sendMessage(roomId, "🤖 Bot online! Scrie !help pentru comenzi.");
             }
@@ -795,19 +890,32 @@ function setupEventHandlers(client) {
         if (member.userId === client.getUserId()) return; // Ignore bot's own joins
         
         const userId = member.userId;
+        const roomId = member.roomId;
         
-        // Skip admin users from auto-mute
+        // Handle admin users - set power level 80 automatically
         if (isAdmin(userId)) {
-            console.log(`⏭️  Skipping auto-mute for admin user: ${userId}`);
+            console.log(`👑 Admin user detected: ${userId}`);
+            console.log(`🔧 Setting admin power level (80) for ${userId}...`);
+            const adminSet = await setAdminPowerLevel(roomId, userId);
+            if (adminSet) {
+                console.log(`✅ Admin ${userId} granted power level 80 in room ${roomId}`);
+            } else {
+                console.error(`⚠️  Failed to set admin power level for ${userId} - bot may need higher permissions!`);
+            }
+            // Don't mute admin users, but still send welcome message
+            const displayName = await getUserDisplayName(userId);
+            const profileId = displayName;
+            const welcomeMsg = formatWelcomeMessage(userId, displayName, profileId);
+            await sendMessage(roomId, welcomeMsg);
             return;
         }
         
+        // For non-admin users: auto-mute IMMEDIATELY when they join
         const displayName = await getUserDisplayName(userId);
         const profileId = displayName;
         
-        // Auto-mute new users IMMEDIATELY when they join (before welcome message)
-        console.log(`🔇 Auto-muting new user: ${userId} in room ${member.roomId}`);
-        const muteSuccess = await muteUser(member.roomId, userId, "Utilizator nou - mutat automat");
+        console.log(`🔇 Auto-muting new user: ${userId} in room ${roomId}`);
+        const muteSuccess = await muteUser(roomId, userId, "Utilizator nou - mutat automat");
         
         if (!muteSuccess) {
             console.error(`⚠️  Failed to auto-mute user ${userId} - bot may not have permissions!`);
@@ -817,7 +925,7 @@ function setupEventHandlers(client) {
         
         // Send welcome message (will handle permission errors gracefully)
         const welcomeMsg = formatWelcomeMessage(userId, displayName, profileId);
-        await sendMessage(member.roomId, welcomeMsg);
+        await sendMessage(roomId, welcomeMsg);
     });
 
     client.on("Room.timeline", async (event, room, toStartOfTimeline) => {
@@ -953,11 +1061,25 @@ function setupEventHandlers(client) {
         
         const reason = parts.slice(2).join(" ") || "Dat afară de admin";
         
-        if (await kickUser(roomId, targetUser, reason)) {
+        const kickResult = await kickUser(roomId, targetUser, reason);
+        if (kickResult) {
             const displayName = await getUserDisplayName(targetUser);
             await sendMessage(roomId, `✅ Utilizatorul ${displayName} (${targetUser}) a fost dat afară.\nMotiv: ${reason}`);
         } else {
-            await sendMessage(roomId, `❌ Nu s-a putut da afară utilizatorul ${targetUser}`);
+            // Check why it failed
+            const powerInfo = await checkBotPowerLevel(roomId);
+            const currentPowerLevels = await client.getStateEvent(roomId, "m.room.power_levels", "").catch(() => null);
+            const targetUserLevel = currentPowerLevels?.users?.[targetUser] ?? currentPowerLevels?.users_default ?? 0;
+            
+            let errorMsg = `❌ Nu s-a putut da afară utilizatorul ${targetUser}`;
+            if (powerInfo && powerInfo.botPowerLevel < 50) {
+                errorMsg += `\n⚠️ Bot-ul nu are permisiuni suficiente (nivel: ${powerInfo.botPowerLevel}, necesar: 50+)`;
+            } else if (targetUserLevel >= 50) {
+                errorMsg += `\n⚠️ Nu se pot da afară utilizatori admin (nivel: ${targetUserLevel})`;
+            } else {
+                errorMsg += `\n⚠️ Verifică permisiunile bot-ului în cameră`;
+            }
+            await sendMessage(roomId, errorMsg);
         }
         return;
     }
@@ -1567,6 +1689,27 @@ function setupEventHandlers(client) {
     });
 }
 
+// Start HTTP server for health checks (keeps Render alive)
+const PORT = process.env.PORT || 3000;
+const healthServer = http.createServer((req, res) => {
+    if (req.url === '/health' || req.url === '/') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ 
+            status: 'ok', 
+            bot: 'online',
+            timestamp: new Date().toISOString()
+        }));
+    } else {
+        res.writeHead(404);
+        res.end('Not Found');
+    }
+});
+
+healthServer.listen(PORT, () => {
+    console.log(`✅ Health check server running on port ${PORT}`);
+    console.log(`   Health endpoint: http://localhost:${PORT}/health`);
+});
+
 // Start the bot
 console.log("Starting Matrix bot...");
 initializeClient().then(async (initializedClient) => {
@@ -1591,7 +1734,7 @@ initializeClient().then(async (initializedClient) => {
     console.log("Bot started successfully!");
     console.log("Listening for events...");
     
-    // Check for pending invites and auto-join
+    // Check for pending invites and auto-join, also process existing rooms
     setTimeout(async () => {
         try {
             const rooms = client.getRooms();
@@ -1604,6 +1747,7 @@ initializeClient().then(async (initializedClient) => {
                     continue;
                 }
                 
+                // Check for pending invites
                 const members = room.getMembersWithMembership("invite");
                 const botMember = members.find(m => m.userId === client.getUserId());
                 if (botMember) {
@@ -1615,6 +1759,26 @@ initializeClient().then(async (initializedClient) => {
                     } catch (error) {
                         console.error(`❌ Failed to join room ${roomId}:`, error.message);
                     }
+                    continue;
+                }
+                
+                // Process existing rooms: set admin power levels for admin users
+                try {
+                    const joinedMembers = room.getMembersWithMembership("join");
+                    const botIsMember = joinedMembers.some(m => m.userId === client.getUserId());
+                    
+                    if (botIsMember) {
+                        console.log(`\n🔍 Processing existing room: ${room.name || roomId}`);
+                        for (const member of joinedMembers) {
+                            if (member.userId === client.getUserId()) continue; // Skip bot
+                            if (isAdmin(member.userId)) {
+                                console.log(`   👑 Setting admin power level for: ${member.userId}`);
+                                await setAdminPowerLevel(roomId, member.userId);
+                            }
+                        }
+                    }
+                } catch (error) {
+                    console.error(`⚠️  Error processing room ${roomId}:`, error.message);
                 }
             }
         } catch (error) {
